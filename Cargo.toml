@@ -1,0 +1,23 @@
+[package]
+name = "transformer-from-scratch-rs"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = "1.0.81"
+candle-core = "0.4.1"
+candle-datasets = "0.4.1"
+candle-nn = "0.4.1"
+hf-hub = "0.3.2"
+parquet = "51.0.0"
+rand = "0.8.5"
+thiserror = "1.0.58"
+tokenizers = { version = "0.15.2", features = ["http"] }
+
+
+[features]
+default = []
+cuda = ["candle-core/cuda"]
+metal = ["candle-core/metal"]
