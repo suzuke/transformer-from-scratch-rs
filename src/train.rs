@@ -1,6 +1,8 @@
+use std::path::Path;
+
 use anyhow::Result;
-use candle_core::{DType, Device, IndexOp, Tensor, D};
-use candle_nn::{loss, optim, Optimizer, VarBuilder, VarMap};
+use candle_core::{DType, Device, IndexOp, Tensor, Var, D};
+use candle_nn::{loss, AdamW, Optimizer, VarBuilder, VarMap};
 use tokenizers::tokenizer::Tokenizer;
 
 use crate::{
@@ -18,61 +20,66 @@ pub fn greedy_decode(
     src_tokenizer: &Tokenizer,
     tgt_tokenizer: &Tokenizer,
     max_tokens: usize,
-    device: Device,
+    device: &Device,
 ) -> Result<Tensor> {
     let sos_id = tgt_tokenizer.token_to_id("[SOS]").unwrap();
     let eos_id = tgt_tokenizer.token_to_id("[EOS]").unwrap();
 
     let encoder_output = model.encode(src, src_mask, false)?; //(batch, seq_len, d_model)
-    let mut decoder_input = Tensor::new(sos_id, &device)?
+    println!("encoder_output: {:?}", encoder_output.shape());
+    let mut decoder_input = Tensor::new(sos_id, device)?
         .reshape((1, 1))? //(batch=1, seq_len=1) -> [[sos]]
         .to_dtype(src.dtype())?;
 
     while decoder_input.dims()[1] < max_tokens {
-        let decoder_mask = causal_mask(decoder_input.dims()[1], &device)?;
-        // println!("decoder_mask: {:?}", decoder_mask.shape());
+        println!("decoder_input: {:?}", decoder_input.shape());
+
+        let decoder_mask = causal_mask(decoder_input.dims()[1], device)?;
+        println!("decoder_mask: {:?}", decoder_mask.shape());
+
         let decoder_output = model.decode(
             &encoder_output,
-            &src_mask,
+            src_mask,
             &decoder_input,
             &decoder_mask,
             false,
         )?; //(batch, seq_len, d_model)
         println!("decoder_output: {:?}", decoder_output.shape());
+
         let decoder_output = decoder_output
             .i((
                 ..,
-                decoder_output.dims()[1] - 1..decoder_output.dims()[1],
+                decoder_output.dims()[1] - 1..,
                 ..,
             ))
+            .unwrap()
+            .squeeze(0)
             .unwrap();
-        println!("decoder_output: {:?}", decoder_output.shape());
+        println!("decoder_output[-1]: {:?}", decoder_output.shape());
         let prob = model.project(&decoder_output)?;
         println!("prob: {:?}", prob.shape());
-        // println!("prob: {:?}", prob.shape());
-        // let (_, next_word) = prob.max(dim)
+        println!("prob argmax: {:?}", prob.argmax(D::Minus1)?.to_vec1::<u32>());
+
         let next_word = prob
             .argmax(D::Minus1)?
             .squeeze(0)?
-            .squeeze(0)?
             .to_vec0::<u32>()?;
         // println!("next_word: {:?}", next_word);
+
         decoder_input = Tensor::cat(
             &[
                 &decoder_input,
-                &Tensor::new(next_word, &device)?
+                &Tensor::new(next_word, device)?
                     .to_dtype(src.dtype())?
                     .reshape((1, 1))?,
             ],
             1,
         )?;
-        println!("decoder_input: {:?}", decoder_input.shape());
 
         if next_word == eos_id {
             break;
         }
     }
-    println!("decoder_input: {:?}", decoder_input.to_vec2::<u32>());
     Ok(decoder_input) //(batch=1, seq_len=max_tokens)
 }
 
@@ -106,7 +113,7 @@ pub fn train_model(config: Config) -> Result<()> {
     println!("dataset: {:?}", dataset.train_set.len());
     println!("dataset: {:?}", dataset.valid_set.len());
 
-    let varmap = VarMap::new();
+    let mut varmap = VarMap::new();
     let vb = VarBuilder::from_varmap(&varmap, dtype, &device);
     let model = transformer(
         src_vocab_size,
@@ -121,7 +128,13 @@ pub fn train_model(config: Config) -> Result<()> {
         vb,
     )?;
 
-    let mut optimizer = optim::AdamW::new_lr(varmap.all_vars(), config.lr)?;
+    let model_path = format!("./model/{0}_{1}_checkpoint.safetensors", config.src_lang, config.tgt_lang);
+    if Path::new(&model_path).exists() {
+        println!("loading model from: {}", model_path);
+        varmap.load(&model_path)?;
+    }
+
+    let mut optimizer = AdamW::new_lr(varmap.all_vars(), config.lr)?;
 
     for epoch in 0..config.num_epochs {
         let train_set_batcher = dataset.train_batcher(config.batch_size);
@@ -137,16 +150,8 @@ pub fn train_model(config: Config) -> Result<()> {
                 false,
             )?; //(batch, seq_len, d_model)
             let proj_output = model.project(&decoder_output)?; //(batch, seq_len, vocab_size)
-            // println!("proj_output: {:?}", proj_output.shape());
-            // println!(
-            //     "proj_output_reshape: {:?}",
-            //     proj_output.flatten_to(1)?.shape()
-            // );
-            // println!("label: {:?}", label.flatten_to(1)?.shape());
             let loss = loss::cross_entropy(
-                // &proj_output.reshape(((), tgt_vocab_size))?, // (batch * seq_len, vocab_size)
                 &proj_output.flatten_to(1)?,
-                // &label.flatten_all()? //(batch * seq_len)
                 &label.flatten_to(1)?,
             )?;
             let _ = optimizer.backward_step(&loss);
@@ -155,12 +160,10 @@ pub fn train_model(config: Config) -> Result<()> {
         }
 
         // validation
-        let mut count = 0;
         if epoch % 1 == 0 {
-            count += 1;
             let valid_set_batcher = dataset.valid_batcher(1);
-            for (encoder_input, decoder_input, encoder_mask, decoder_mask, label) in
-                valid_set_batcher
+            for (encoder_input, _, encoder_mask, _, label) in
+                valid_set_batcher.take(3)
             {
                 let model_out = greedy_decode(
                     &model,
@@ -168,12 +171,12 @@ pub fn train_model(config: Config) -> Result<()> {
                     &encoder_mask,
                     &tokenizer_src,
                     &tokenizer_tgt,
-                    10, // config.seq_len,
-                    device.clone(),
+                    10, //config.seq_len,
+                    &device,
                 )?;
                 println!("model_out: {:?}", model_out.squeeze(0)?.to_vec1::<u32>()?);
 
-                let skip_special_tokens = true;
+                let skip_special_tokens = false;
                 let model_out_text =
                     ids_to_text(&tokenizer_tgt, &model_out.squeeze(0)?, skip_special_tokens);
                 let encoder_input_text = ids_to_text(
@@ -187,12 +190,11 @@ pub fn train_model(config: Config) -> Result<()> {
                 println!("encoder_input_text: {:?}", encoder_input_text);
                 println!("label_text: {:?}", label_text);
                 println!("model_out_text: {:?}", model_out_text);
-
-                if count >= 1 {
-                    break;
-                }
             }
         }
+
+        // save model
+        varmap.save(&model_path)?
     }
 
     Ok(())
